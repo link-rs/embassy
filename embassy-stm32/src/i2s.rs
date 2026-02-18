@@ -4,11 +4,84 @@ use embassy_futures::join::join;
 use stm32_metapac::spi::vals;
 
 use crate::dma::{ringbuffer, ChannelAndRequest, ReadableRingBuffer, TransferOptions, WritableRingBuffer};
-use crate::gpio::{AfType, AnyPin, OutputType, SealedPin, Speed};
+use crate::gpio::{AfType, AnyPin, OutputType, Pin, SealedPin, Speed};
 use crate::mode::Async;
 use crate::spi::{Config as SpiConfig, RegsExt as _, *};
 use crate::time::Hertz;
 use crate::Peri;
+
+// =============================================================================
+// I2SEXT support traits
+//
+// The STM32F4 I2S peripherals (SPI2/SPI3) have associated I2SEXT peripherals
+// (I2S2EXT/I2S3EXT) that enable true full-duplex I2S on spi_v2. These are not
+// captured by stm32-metapac, so we define custom traits for:
+//   * The association between SPI and I2SEXT register blocks
+//   * AF mappings for the I2SEXT data pin
+//   * DMA request numbers for routing DMA to I2SEXT
+// =============================================================================
+
+/// Maps an SPI peripheral to its associated I2SEXT peripheral, if any.
+///
+/// On STM32F4, SPI2 has I2S2EXT and SPI3 has I2S3EXT. The I2SEXT peripheral
+/// provides a second data line for full-duplex I2S (one direction on the main
+/// SPI, the other on I2SEXT).
+pub trait I2sExtRegs {
+    /// The register block for the associated I2SEXT peripheral.
+    fn regs_ext() -> Option<crate::pac::spi::Spi> {
+        None
+    }
+}
+
+#[cfg(stm32f405)]
+impl I2sExtRegs for crate::peripherals::SPI2 {
+    fn regs_ext() -> Option<crate::pac::spi::Spi> {
+        // I2S2EXT at 0x4000_3400 (see STM32F405 reference manual, memory map)
+        unsafe { Some(crate::pac::spi::Spi::from_ptr(0x4000_3400 as *mut ())) }
+    }
+}
+
+#[cfg(stm32f405)]
+impl I2sExtRegs for crate::peripherals::SPI3 {
+    fn regs_ext() -> Option<crate::pac::spi::Spi> {
+        // I2S3EXT at 0x4000_4000 (see STM32F405 reference manual, memory map)
+        unsafe { Some(crate::pac::spi::Spi::from_ptr(0x4000_4000 as *mut ())) }
+    }
+}
+
+/// Provides the DMA request number for routing a DMA channel to an I2SEXT
+/// peripheral.
+pub trait RxDmaExt<T: Instance>: crate::dma::ChannelInstance {
+    /// Get the DMA request number needed to use this channel with I2SEXT.
+    fn request(&self) -> crate::dma::Request;
+
+    /// Remap the DMA channel (no-op for most configurations).
+    fn remap(&self);
+}
+
+#[cfg(stm32f405)]
+impl RxDmaExt<crate::peripherals::SPI3> for crate::peripherals::DMA1_CH0 {
+    fn request(&self) -> crate::dma::Request {
+        3 // DMA1 Stream 0, Channel 3 = I2S3EXT_RX (see STM32F405 DMA mapping)
+    }
+
+    fn remap(&self) {}
+}
+
+/// Provides the AF number for a pin used as the data line on an I2SEXT
+/// peripheral.
+pub trait SdExtPin<T>: Pin {
+    /// Get the AF number needed to use this pin as I2SEXT SD.
+    fn af_num(&self) -> u8;
+}
+
+#[cfg(stm32f405)]
+impl SdExtPin<crate::peripherals::SPI3> for crate::peripherals::PB4 {
+    #[inline(always)]
+    fn af_num(&self) -> u8 {
+        7 // AF7 (see STM32F405 datasheet, alternate function mapping)
+    }
+}
 
 /// I2S mode
 #[derive(Copy, Clone)]

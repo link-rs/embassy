@@ -51,7 +51,7 @@ impl I2sExtRegs for crate::peripherals::SPI3 {
 
 /// Provides the DMA request number for routing a DMA channel to an I2SEXT
 /// peripheral.
-pub trait RxDmaExt<T: Instance>: crate::dma::ChannelInstance {
+pub trait RxDmaExt<T: Instance>: crate::dma::Channel {
     /// Get the DMA request number needed to use this channel with I2SEXT.
     fn request(&self) -> crate::dma::Request;
 
@@ -264,7 +264,7 @@ pub struct Writer<'s, 'd, W: Word>(&'s mut WritableRingBuffer<'d, W>);
 impl<'s, 'd, W: Word> Writer<'s, 'd, W> {
     /// Write data to the I2S ringbuffer.
     /// This appends the data to the buffer and returns immediately. The data will be transmitted in the background.
-    /// If thfre’s no space in the buffer, this waits until there is.
+    /// If thfre's no space in the buffer, this waits until there is.
     pub async fn write(&mut self, data: &[W]) -> Result<(), Error> {
         self.0.write_exact(data).await?;
         Ok(())
@@ -284,7 +284,7 @@ pub struct Reader<'s, 'd, W: Word>(&'s mut ReadableRingBuffer<'d, W>);
 impl<'s, 'd, W: Word> Reader<'s, 'd, W> {
     /// Read data from the I2S ringbuffer.
     /// SAI is always receiving data in the background. This function pops already-received data from the buffer.
-    /// If there’s less than data.len() data in the buffer, this waits until there is.
+    /// If there's less than data.len() data in the buffer, this waits until there is.
     pub async fn read(&mut self, data: &mut [W]) -> Result<(), Error> {
         self.0.read_exact(data).await?;
         Ok(())
@@ -310,6 +310,9 @@ pub struct I2S<'d, W: Word> {
     mck: Option<Peri<'d, AnyPin>>,
     tx_ring_buffer: Option<WritableRingBuffer<'d, W>>,
     rx_ring_buffer: Option<ReadableRingBuffer<'d, W>>,
+    /// I2SEXT register block for spi_v2 full-duplex. When present, RX DMA
+    /// reads from this peripheral instead of the main SPI.
+    regs_ext: Option<crate::pac::spi::Spi>,
 }
 
 impl<'d, W: Word> I2S<'d, W> {
@@ -335,6 +338,7 @@ impl<'d, W: Word> I2S<'d, W> {
             None,
             config,
             Function::Transmit,
+            None,
         )
     }
 
@@ -359,6 +363,7 @@ impl<'d, W: Word> I2S<'d, W> {
             None,
             config,
             Function::Transmit,
+            None,
         )
     }
 
@@ -384,12 +389,61 @@ impl<'d, W: Word> I2S<'d, W> {
             new_dma!(rxdma).map(|d| (d, rxdma_buf)),
             config,
             Function::Receive,
+            None,
+        )
+    }
+
+    /// Create a full duplex driver using I2SEXT for the receive direction.
+    ///
+    /// On STM32F4 (spi_v2), true full-duplex I2S requires the I2SEXT peripheral.
+    /// The main SPI transmits while the associated I2SEXT receives. The `rxsd`
+    /// pin connects to I2SEXT and `rxdma` is routed to the I2SEXT peripheral.
+    #[cfg(spi_v2)]
+    pub fn new_full_duplex<T: Instance + I2sExtRegs, D2: RxDmaExt<T>>(
+        peri: Peri<'d, T>,
+        ws: Peri<'d, impl WsPin<T>>,
+        ck: Peri<'d, impl CkPin<T>>,
+        txsd: Peri<'d, impl MosiPin<T>>,
+        rxsd: Peri<'d, impl SdExtPin<T>>,
+        txdma: Peri<'d, impl TxDma<T>>,
+        txdma_buf: &'d mut [W],
+        rxdma: Peri<'d, D2>,
+        rxdma_buf: &'d mut [W],
+        config: Config,
+    ) -> Self {
+        // Configure rxsd pin using SdExtPin AF (UFCS avoids af_num() ambiguity
+        // with any standard pin trait on the same pin).
+        let rxsd_af = <_ as SdExtPin<T>>::af_num(&*rxsd);
+        rxsd.set_as_af(rxsd_af, AfType::output(OutputType::PushPull, Speed::VeryHigh));
+        let rxsd_pin: Peri<'d, AnyPin> = rxsd.into();
+
+        // Construct RX DMA ChannelAndRequest using RxDmaExt trait methods
+        // (UFCS avoids ambiguity with any standard RxDma impl on the same channel).
+        <D2 as RxDmaExt<T>>::remap(&*rxdma);
+        let rx_request = <D2 as RxDmaExt<T>>::request(&*rxdma);
+        let rx_ch = ChannelAndRequest {
+            channel: rxdma.into(),
+            request: rx_request,
+        };
+
+        Self::new_inner(
+            peri,
+            new_pin!(txsd, AfType::output(OutputType::PushPull, Speed::VeryHigh)),
+            Some(rxsd_pin),
+            ws,
+            ck,
+            None,
+            new_dma!(txdma).map(|d| (d, txdma_buf)),
+            Some((rx_ch, rxdma_buf)),
+            config,
+            Function::Transmit, // Main SPI is configured as TX; I2SEXT handles RX
+            T::regs_ext(),
         )
     }
 
     #[cfg(spi_v3)]
     /// Create a full duplex driver.
-    pub fn new_full_duplex<T: Instance>(
+    pub fn new_full_duplex_native<T: Instance>(
         peri: Peri<'d, T>,
         txsd: Peri<'d, impl MosiPin<T>>,
         rxsd: Peri<'d, impl MisoPin<T>>,
@@ -413,35 +467,48 @@ impl<'d, W: Word> I2S<'d, W> {
             new_dma!(rxdma).map(|d| (d, rxdma_buf)),
             config,
             Function::FullDuplex,
+            None,
         )
     }
 
     /// Start I2S driver.
     pub fn start(&mut self) {
-        self.spi.info.regs.cr1().modify(|w| {
-            w.set_spe(false);
-        });
+        let regs_tx = self.regs_tx();
+        let regs_rx = self.regs_rx();
+
+        regs_tx.cr1().modify(|w| w.set_spe(false));
+        if let Some(ext) = self.regs_ext {
+            ext.cr1().modify(|w| w.set_spe(false));
+        }
+
         self.spi.set_word_size(W::CONFIG);
+
         if let Some(tx_ring_buffer) = &mut self.tx_ring_buffer {
             tx_ring_buffer.start();
-
-            set_txdmaen(self.spi.info.regs, true);
+            set_txdmaen(regs_tx, true);
         }
         if let Some(rx_ring_buffer) = &mut self.rx_ring_buffer {
             rx_ring_buffer.start();
             // SPIv3 clears rxfifo on SPE=0
             #[cfg(not(any(spi_v3, spi_v4, spi_v5)))]
-            flush_rx_fifo(self.spi.info.regs);
-
-            set_rxdmaen(self.spi.info.regs, true);
+            flush_rx_fifo(regs_rx);
+            set_rxdmaen(regs_rx, true);
         }
-        self.spi.info.regs.cr1().modify(|w| {
-            w.set_spe(true);
-        });
+
+        regs_tx.cr1().modify(|w| w.set_spe(true));
+        if let Some(ext) = self.regs_ext {
+            ext.cr1().modify(|w| w.set_spe(true));
+        }
+
+        #[cfg(any(spi_v1, spi_v2, spi_v3))]
+        {
+            regs_tx.i2scfgr().modify(|w| w.set_i2se(true));
+            if let Some(ext) = self.regs_ext {
+                ext.i2scfgr().modify(|w| w.set_i2se(true));
+            }
+        }
         #[cfg(any(spi_v3, spi_v4, spi_v5))]
-        self.spi.info.regs.cr1().modify(|w| {
-            w.set_cstart(true);
-        });
+        regs_tx.cr1().modify(|w| w.set_cstart(true));
     }
 
     /// Reset the ring buffer to its initial state.
@@ -457,21 +524,20 @@ impl<'d, W: Word> I2S<'d, W> {
 
     /// Stop I2S driver.
     pub async fn stop(&mut self) {
-        let regs = self.spi.info.regs;
+        let regs_tx = self.regs_tx();
+        let regs_rx = self.regs_rx();
 
         let tx_f = async {
             if let Some(tx_ring_buffer) = &mut self.tx_ring_buffer {
                 tx_ring_buffer.stop().await;
-
-                set_txdmaen(regs, false);
+                set_txdmaen(regs_tx, false);
             }
         };
 
         let rx_f = async {
             if let Some(rx_ring_buffer) = &mut self.rx_ring_buffer {
                 rx_ring_buffer.stop().await;
-
-                set_rxdmaen(regs, false);
+                set_rxdmaen(regs_rx, false);
             }
         };
 
@@ -480,15 +546,18 @@ impl<'d, W: Word> I2S<'d, W> {
         #[cfg(any(spi_v3, spi_v4, spi_v5))]
         {
             if let Mode::Master = self.mode {
-                regs.cr1().modify(|w| {
+                regs_tx.cr1().modify(|w| {
                     w.set_csusp(true);
                 });
 
-                while regs.cr1().read().cstart() {}
+                while regs_tx.cr1().read().cstart() {}
             }
         }
 
-        regs.cr1().modify(|w| {
+        regs_tx.cr1().modify(|w| {
+            w.set_spe(false);
+        });
+        regs_rx.cr1().modify(|w| {
             w.set_spe(false);
         });
 
@@ -508,7 +577,7 @@ impl<'d, W: Word> I2S<'d, W> {
 
     /// Read data from the I2S ringbuffer.
     /// SAI is always receiving data in the background. This function pops already-received data from the buffer.
-    /// If there’s less than data.len() data in the buffer, this waits until there is.
+    /// If there's less than data.len() data in the buffer, this waits until there is.
     pub async fn read(&mut self, data: &mut [W]) -> Result<(), Error> {
         match &mut self.rx_ring_buffer {
             Some(ring) => Reader(ring).read(data).await,
@@ -518,7 +587,7 @@ impl<'d, W: Word> I2S<'d, W> {
 
     /// Write data to the I2S ringbuffer.
     /// This appends the data to the buffer and returns immediately. The data will be transmitted in the background.
-    /// If thfre’s no space in the buffer, this waits until there is.
+    /// If thfre's no space in the buffer, this waits until there is.
     pub async fn write(&mut self, data: &[W]) -> Result<(), Error> {
         match &mut self.tx_ring_buffer {
             Some(ring) => Writer(ring).write(data).await,
@@ -535,6 +604,30 @@ impl<'d, W: Word> I2S<'d, W> {
         }
     }
 
+    /// Simultaneous read and write.
+    pub async fn read_write(&mut self, tx_data: &[W], rx_data: &mut [W]) -> Result<(), Error> {
+        match (&mut self.tx_ring_buffer, &mut self.rx_ring_buffer) {
+            (Some(tx_ring), Some(rx_ring)) => {
+                let tx_f = tx_ring.write_exact(tx_data);
+                let rx_f = rx_ring.read_exact(rx_data);
+                let (tx_r, rx_r) = join(tx_f, rx_f).await;
+                tx_r?;
+                rx_r?;
+                Ok(())
+            }
+            (None, _) => Err(Error::NotATransmitter),
+            (_, None) => Err(Error::NotAReceiver),
+        }
+    }
+
+    fn regs_tx(&self) -> crate::pac::spi::Spi {
+        self.spi.info.regs
+    }
+
+    fn regs_rx(&self) -> crate::pac::spi::Spi {
+        self.regs_ext.unwrap_or(self.spi.info.regs)
+    }
+
     fn new_inner<T: Instance>(
         peri: Peri<'d, T>,
         txsd: Option<Peri<'d, AnyPin>>,
@@ -546,6 +639,7 @@ impl<'d, W: Word> I2S<'d, W> {
         rxdma: Option<(ChannelAndRequest<'d>, &'d mut [W])>,
         config: Config,
         function: Function,
+        regs_ext: Option<crate::pac::spi::Spi>,
     ) -> Self {
         ws.set_as_af(ws.af_num(), AfType::output(OutputType::PushPull, config.gpio_speed));
         ck.set_as_af(ck.af_num(), AfType::output(OutputType::PushPull, config.gpio_speed));
@@ -644,8 +738,41 @@ impl<'d, W: Word> I2S<'d, W> {
                 w.set_i2se(true);
             });
 
+            // Configure I2SEXT peripheral identically, but in the opposite direction
+            // and always in slave mode.
+            if let Some(ext) = regs_ext {
+                ext.i2spr().modify(|w| {
+                    w.set_i2sdiv(2);
+                    w.set_odd(Odd::EVEN);
+                    w.set_mckoe(false);
+                });
+
+                ext.i2scfgr().modify(|w| {
+                    w.set_ckpol(config.clock_polarity.ckpol());
+
+                    w.set_i2smod(true);
+
+                    w.set_i2sstd(config.standard.i2sstd());
+                    w.set_pcmsync(config.standard.pcmsync());
+
+                    w.set_datlen(config.format.datlen());
+                    w.set_chlen(config.format.chlen());
+
+                    w.set_i2scfg(match (config.mode, function) {
+                        (Mode::Master, Function::Transmit) => I2scfg::SLAVE_RX,
+                        (Mode::Master, Function::Receive) => I2scfg::SLAVE_TX,
+                        (Mode::Slave, Function::Transmit) => I2scfg::SLAVE_RX,
+                        (Mode::Slave, Function::Receive) => I2scfg::SLAVE_TX,
+                    });
+
+                    w.set_i2se(true);
+                });
+            }
+
             let mut opts = TransferOptions::default();
             opts.half_transfer_ir = true;
+
+            let regs_rx = regs_ext.unwrap_or(regs);
 
             Self {
                 mode: config.mode,
@@ -659,8 +786,9 @@ impl<'d, W: Word> I2S<'d, W> {
                     WritableRingBuffer::new(ch.channel, ch.request, regs.tx_ptr(), buf, opts)
                 }),
                 rx_ring_buffer: rxdma.map(|(ch, buf)| unsafe {
-                    ReadableRingBuffer::new(ch.channel, ch.request, regs.rx_ptr(), buf, opts)
+                    ReadableRingBuffer::new(ch.channel, ch.request, regs_rx.rx_ptr(), buf, opts)
                 }),
+                regs_ext,
             }
         }
     }

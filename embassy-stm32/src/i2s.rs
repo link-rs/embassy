@@ -398,7 +398,7 @@ impl<'d, W: Word> I2S<'d, W> {
     /// On STM32F4 (spi_v2), true full-duplex I2S requires the I2SEXT peripheral.
     /// The main SPI transmits while the associated I2SEXT receives. The `rxsd`
     /// pin connects to I2SEXT and `rxdma` is routed to the I2SEXT peripheral.
-    #[cfg(spi_v2)]
+    #[cfg(any(spi_v1, spi_v2))]
     pub fn new_full_duplex<T: Instance + I2sExtRegs, D2: RxDmaExt<T>>(
         peri: Peri<'d, T>,
         ws: Peri<'d, impl WsPin<T>>,
